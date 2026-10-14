@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -9,6 +10,9 @@ from google.genai import types
 from pypdf import PdfReader
 
 MODEL = "gemini-3.8-flash"
+# Tried in order if the main model is overloaded (503) or rate-limited (429).
+FALLBACK_MODELS = ["gemini-flash-latest"]
+RETRIES_PER_MODEL = 3
 
 st.set_page_config(page_title="ATS Resume Checker", page_icon="📄", layout="centered")
 
@@ -107,13 +111,29 @@ def analyze_with_ai(api_key: str, resume: str, job_desc: str) -> dict:
     jd_clause = " against the job description" if job_desc.strip() else " for general ATS-friendliness"
     jd_block = f'\nJOB DESCRIPTION:\n"""\n{job_desc}\n"""' if job_desc.strip() else ""
     prompt = PROMPT.format(jd_clause=jd_clause, resume=resume[:15000], jd_block=jd_block)
-    resp = client.models.generate_content(
-        model=MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json", temperature=0.2
-        ),
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json", temperature=0.2
     )
+    resp = None
+    last_err = None
+    for model in [MODEL] + FALLBACK_MODELS:
+        for attempt in range(RETRIES_PER_MODEL):
+            try:
+                resp = client.models.generate_content(
+                    model=model, contents=prompt, config=config
+                )
+                break
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                temporary = any(k in msg for k in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded"))
+                if not temporary:
+                    raise  # real error (bad key, 404 model, etc.): don't retry
+                time.sleep(2 ** attempt)  # wait 1s, 2s, 4s
+        if resp is not None:
+            break
+    if resp is None:
+        raise last_err
     raw = (resp.text or "").strip()
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
     return json.loads(raw)
@@ -157,7 +177,10 @@ if st.button("Check ATS score", type="primary", disabled=uploaded is None):
         with st.spinner("Analyzing with AI..."):
             ai = analyze_with_ai(api_key, text, job_desc)
     except Exception as e:
-        st.error(f"AI analysis failed: {e}")
+        if any(k in str(e) for k in ("503", "429", "UNAVAILABLE")):
+            st.error("Google's AI servers are busy right now. Please wait a minute and try again.")
+        else:
+            st.error(f"AI analysis failed: {e}")
         st.stop()
 
     ai_score = max(0, min(100, int(ai.get("ai_score", 0))))
